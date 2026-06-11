@@ -8,11 +8,21 @@ const { Server } = require("socket.io");
 const app = express();
 app.use(cors());
 
-const server = http.createServer(app);
-const io = new Server(server, {
-  cors: { origin: "*" }
+// 🔥 LOGGING MIDDLEWARE (untuk debugging Railway)
+app.use((req, res, next) => {
+  console.log(`${new Date().toISOString()} - ${req.method} ${req.url}`);
+  next();
 });
 
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: { 
+    origin: "*",
+    methods: ["GET", "POST"]
+  }
+});
+
+// 🔥 RAILWAY PORT CONFIGURATION
 const PORT = process.env.PORT || 8080;
 
 // 🔥 FULL PASARAN
@@ -75,31 +85,32 @@ const PASARAN = {
 
 let cache = {};
 
-// 🔄 SCRAPE FINAL
+// 🔄 SCRAPE FINAL dengan timeout
 async function scrape(kode) {
   try {
     const url = `https://kartuhappy.com/history/result/${kode}/kosong`;
-    const { data } = await axios.get(url);
+    
+    // 🔥 Tambahkan timeout untuk mencegah hanging
+    const { data } = await axios.get(url, { 
+      timeout: 5000,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+      }
+    });
+    
     const $ = cheerio.load(data);
-
     const todayStr = new Date().toISOString().split("T")[0];
-
     let found = null;
 
     $("table tbody tr").each((i, el) => {
-
       const cols = $(el).find("td");
-
       let tanggalText = "";
       let angka = "";
 
-      // 🔥 NORMAL
       if (!kode.startsWith("m")) {
         tanggalText = cols.eq(2).text().trim();
         angka = cols.eq(3).text().trim();
-      } 
-      // 🔥 MACAU FIX
-      else {
+      } else {
         tanggalText = cols.eq(1).text().trim();
         angka = cols.eq(2).text().trim();
       }
@@ -107,7 +118,6 @@ async function scrape(kode) {
       if (!tanggalText || !angka) return;
 
       let [tanggal, jam] = tanggalText.split("|").map(x => x.trim());
-
       if (!tanggal) return;
 
       if (tanggal === todayStr) {
@@ -116,7 +126,6 @@ async function scrape(kode) {
       }
     });
 
-    // ❌ BELUM ADA
     if (!found) {
       cache[kode] = {
         kode,
@@ -132,8 +141,6 @@ async function scrape(kode) {
     }
 
     const { tanggal, jam, angka } = found;
-
-    // 🔥 HITUNG MANUAL TIME (ANTI BUG)
     const now = new Date();
     const nowWIB = new Date(now.getTime() + (7 * 60 * 60 * 1000));
 
@@ -142,23 +149,18 @@ async function scrape(kode) {
 
     if (jam) {
       const [h, m] = jam.split(":").map(Number);
-
       const resultMinutes = h * 60 + m;
       const nowMinutes = nowWIB.getHours() * 60 + nowWIB.getMinutes();
-
       diffMinutes = nowMinutes - resultMinutes;
       if (diffMinutes < 0) diffMinutes += 1440;
 
       if (diffMinutes < 1) {
         waktuLalu = "baru saja";
-      } 
-      else if (diffMinutes < 60) {
+      } else if (diffMinutes < 60) {
         waktuLalu = `${diffMinutes} menit lalu`;
-      } 
-      else {
+      } else {
         const jamnya = Math.floor(diffMinutes / 60);
         const sisamenit = diffMinutes % 60;
-
         waktuLalu = sisamenit === 0
           ? `${jamnya} jam lalu`
           : `${jamnya} jam ${sisamenit} menit lalu`;
@@ -180,33 +182,128 @@ async function scrape(kode) {
     const old = cache[kode];
     cache[kode] = newData;
 
-    // 🔥 REALTIME PUSH
     if (!old || old.angka !== newData.angka) {
       io.emit("update", newData);
       console.log("🔥 UPDATE:", kode, angka);
     }
 
   } catch (err) {
-    console.log("Error:", kode);
+    console.error(`❌ Error scraping ${kode}:`, err.message);
   }
 }
 
-// 🔁 LOOP REALTIME
+// 🔁 LOOP REALTIME - Interval lebih lama untuk Railway
 setInterval(() => {
+  console.log("🔄 Starting scrape cycle...");
   Object.keys(PASARAN).forEach(scrape);
-}, 2000);
+}, 10000); // Ubah dari 2000 ke 10000 (10 detik) untuk mengurangi beban
 
-// API
+// ==================== ROUTES ====================
+
+// 🔥 ROOT ROUTE - WAJIB ADA untuk Railway
+app.get("/", (req, res) => {
+  res.json({
+    status: "running",
+    message: "Backend realtime aktif",
+    totalPasaran: Object.keys(PASARAN).length,
+    cachedData: Object.keys(cache).length,
+    uptime: process.uptime(),
+    timestamp: new Date().toISOString()
+  });
+});
+
+// 🔥 API ENDPOINTS
 app.get("/api", (req, res) => {
-  res.json(cache[req.query.kode] || {});
+  const { kode } = req.query;
+  
+  if (!kode) {
+    return res.json({
+      message: "Gunakan parameter ?kode=m17",
+      availableCodes: Object.keys(PASARAN).slice(0, 10),
+      totalCodes: Object.keys(PASARAN).length
+    });
+  }
+  
+  res.json(cache[kode] || { error: "Kode tidak ditemukan", kode });
+});
+
+// 🔥 Endpoint untuk list semua pasaran
+app.get("/api/pasaran", (req, res) => {
+  res.json({
+    total: Object.keys(PASARAN).length,
+    pasaran: PASARAN
+  });
+});
+
+// 🔥 Endpoint untuk semua data cache
+app.get("/api/all", (req, res) => {
+  res.json({
+    total: Object.keys(cache).length,
+    data: cache
+  });
+});
+
+// 🔥 Health check endpoint (penting untuk Railway monitoring)
+app.get("/health", (req, res) => {
+  res.json({
+    status: "healthy",
+    uptime: process.uptime(),
+    memory: process.memoryUsage(),
+    cacheSize: Object.keys(cache).length,
+    timestamp: new Date().toISOString()
+  });
 });
 
 // SOCKET
 io.on("connection", (socket) => {
+  console.log("🔌 Client connected:", socket.id);
   socket.emit("init", cache);
+  
+  socket.on("disconnect", () => {
+    console.log("❌ Client disconnected:", socket.id);
+  });
 });
 
-// START
-server.listen(PORT, () => {
-  console.log("🚀 Backend realtime aktif");
+// 🔥 ERROR HANDLER 404
+app.use((req, res) => {
+  res.status(404).json({ 
+    error: "Route not found",
+    message: `Cannot ${req.method} ${req.url}`,
+    suggestion: "Try: GET /api?kode=m17"
+  });
+});
+
+// 🔥 GLOBAL ERROR HANDLER
+app.use((err, req, res, next) => {
+  console.error("💥 Unhandled error:", err);
+  res.status(500).json({
+    error: "Internal server error",
+    message: process.env.NODE_ENV === 'production' ? 'Something went wrong' : err.message
+  });
+});
+
+// START SERVER
+server.listen(PORT, "0.0.0.0", () => {
+  console.log("🚀 Backend realtime aktif di port", PORT);
+  console.log("📍 Test root: http://localhost:" + PORT + "/");
+  console.log("📍 Test API: http://localhost:" + PORT + "/api?kode=m17");
+  console.log("📍 Health check: http://localhost:" + PORT + "/health");
+  console.log("📊 Total pasaran:", Object.keys(PASARAN).length);
+});
+
+// 🔥 Graceful shutdown untuk Railway
+process.on('SIGTERM', () => {
+  console.log('SIGTERM received. Shutting down gracefully...');
+  server.close(() => {
+    console.log('Server closed');
+    process.exit(0);
+  });
+});
+
+process.on('SIGINT', () => {
+  console.log('SIGINT received. Shutting down gracefully...');
+  server.close(() => {
+    console.log('Server closed');
+    process.exit(0);
+  });
 });
